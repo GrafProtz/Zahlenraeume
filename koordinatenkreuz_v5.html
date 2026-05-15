@@ -1,0 +1,485 @@
+
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+#game-wrap { width: 100%; background: #0a0a1a; border-radius: 12px; overflow: hidden; user-select: none; touch-action: none; }
+canvas { display: block; width: 100%; }
+#hud { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: #111128; border-top: 0.5px solid #2a2a4a; font-family: monospace; }
+#pos-display { font-size: 15px; color: #7ec8e3; font-weight: 500; }
+#btn-row { display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: auto auto; gap: 6px; padding: 10px 16px 12px; background: #111128; }
+#btn-row button { padding: 9px 0; font-size: 13px; background: #1a1a3a; color: #aab0d0; border: 0.5px solid #3a3a6a; border-radius: 8px; cursor: pointer; }
+#btn-row button:active { transform: scale(0.97); }
+#btn-up { grid-column:2; grid-row:1; }
+#btn-left { grid-column:1; grid-row:2; }
+#btn-down { grid-column:2; grid-row:2; }
+#btn-right { grid-column:3; grid-row:2; }
+</style>
+
+<div id="game-wrap">
+  <canvas id="c" height="360"></canvas>
+  <div id="hud"><span id="pos-display">( 0 | 0 )</span></div>
+  <div id="btn-row">
+    <button id="btn-up">↑ hoch</button>
+    <button id="btn-left">← links</button>
+    <button id="btn-down">↓ runter</button>
+    <button id="btn-right">rechts →</button>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 680, H = 360;
+canvas.width = W; canvas.height = H;
+const GRID = 56, SCX = W/2, SCY = H/2;
+
+// ── AUDIO ──────────────────────────────────────────────────
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSnap(isAxis, isOrigin) {
+  ensureAudio();
+  const now = audioCtx.currentTime;
+  // Knack: kurzes Rauschen
+  const bufLen = Math.floor(audioCtx.sampleRate * 0.02);
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const bd = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++)
+    bd[i] = (Math.random()*2-1) * Math.exp(-i/(audioCtx.sampleRate*0.003));
+  const ns = audioCtx.createBufferSource();
+  const nf = audioCtx.createBiquadFilter();
+  nf.type = 'bandpass'; nf.frequency.value = isAxis ? 300 : 500; nf.Q.value = 2;
+  const ng = audioCtx.createGain();
+  ng.gain.setValueAtTime(isOrigin ? 1.0 : isAxis ? 0.7 : 0.5, now);
+  ns.buffer = buf; ns.connect(nf); nf.connect(ng); ng.connect(audioCtx.destination); ns.start(now);
+  // Tiefer Bump
+  const bump = audioCtx.createOscillator();
+  const bg = audioCtx.createGain();
+  bump.type = 'sine'; bump.frequency.setValueAtTime(isAxis?100:160, now);
+  bump.frequency.exponentialRampToValueAtTime(30, now+0.07);
+  bg.gain.setValueAtTime(isOrigin?0.45:isAxis?0.3:0.18, now);
+  bg.gain.exponentialRampToValueAtTime(0.001, now+0.1);
+  bump.connect(bg); bg.connect(audioCtx.destination); bump.start(now); bump.stop(now+0.12);
+  // Ping
+  const ping = audioCtx.createOscillator();
+  const pg = audioCtx.createGain();
+  ping.type = 'sine'; ping.frequency.value = isOrigin?880:isAxis?520:660;
+  pg.gain.setValueAtTime(isOrigin?0.28:isAxis?0.16:0.11, now);
+  pg.gain.exponentialRampToValueAtTime(0.001, now+(isOrigin?0.5:0.15));
+  ping.connect(pg); pg.connect(audioCtx.destination); ping.start(now); ping.stop(now+0.6);
+}
+function playOriginPling() {
+  ensureAudio();
+  const now = audioCtx.currentTime;
+  [[1046.5,0.3,1.5],[1318.5,0.17,1.1],[1568,0.1,0.9]].forEach(([f,v,d])=>{
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.type='sine'; o.frequency.value=f;
+    g.gain.setValueAtTime(v,now); g.gain.exponentialRampToValueAtTime(0.001,now+d);
+    o.connect(g); g.connect(audioCtx.destination); o.start(now); o.stop(now+d+0.05);
+  });
+  playSnap(false, true);
+}
+
+// ── ZUSTAND ────────────────────────────────────────────────
+let posX=0, posY=0;
+let velX=0, velY=0;
+const keys = {};
+let walkFrame = 0;
+
+// Snap-Zustand: getrennt für X und Y
+let isSnappedX = true, targetX = 0;
+let isSnappedY = true, targetY = 0;
+let hasSnappedX = false, hasSnappedY = false;
+
+// Visuals
+let shakeX=0, shakeY=0;
+let pulseR=0, pulseA=0, pulseCol='#7ec8e3';
+let lineFlashXv=0, lineFlashXpos=0;
+let lineFlashYv=0, lineFlashYpos=0;
+let atOrigin=true, originFlash=0, originPulse=0;
+
+function wx(wx){ return SCX+(wx-posX)*GRID; }
+function wy(wy){ return SCY-(wy-posY)*GRID; }
+
+// ── PHYSIK ─────────────────────────────────────────────────
+// Werte klein halten – Bewegung soll sofort spürbar sein
+const ACCEL    = 0.035;   // Beschleunigung pro Frame (reduziert für Präzision)
+const FRICTION = 0.84;    // Reibung (angepasst für Magnet-Sog)
+const SNAP_THRESHOLD = 0.32; // Magnet greift bei geringerer Geschwindigkeit (Gleitphase)
+const SNAP_STRENGTH  = 0.45; // Sehr starke Magnetkraft für knackiges Finale
+const SNAP_MARGIN    = 0.38; // Kleinere Einzugszone (entkoppelt die Gitterpunkte)
+const SNAP_LOCK      = 0.01; // Ab wann hart eingerastet
+
+function updatePhysics() {
+  hasSnappedX = false;
+  hasSnappedY = false;
+
+  // 1. Input-Erkennung & Beschleunigung
+  const inputX = keys['ArrowLeft'] || keys['ArrowRight'] || keys['a'] || keys['d'] || keys['A'] || keys['D'];
+  const inputY = keys['ArrowUp'] || keys['ArrowDown'] || keys['w'] || keys['s'] || keys['W'] || keys['S'];
+
+  if (keys['ArrowLeft']  || keys['a'] || keys['A']) { velX -= ACCEL; isSnappedX = false; }
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) { velX += ACCEL; isSnappedX = false; }
+  if (keys['ArrowUp']    || keys['w'] || keys['W']) { velY += ACCEL; isSnappedY = false; }
+  if (keys['ArrowDown']  || keys['s'] || keys['S']) { velY -= ACCEL; isSnappedY = false; }
+
+  // 2. Reibung & Bewegung
+  velX *= FRICTION;
+  velY *= FRICTION;
+  if (Math.abs(velX) < 0.0001) velX = 0;
+  if (Math.abs(velY) < 0.0001) velY = 0;
+
+  posX += velX;
+  posY += velY;
+
+  // 3. Snap-Logik X (Magnet greift nur ohne Nutzer-Input)
+  const tX = Math.round(posX);
+  const distX = tX - posX;
+
+  if (!inputX && !isSnappedX) {
+    if (Math.abs(velX) < SNAP_THRESHOLD && Math.abs(distX) < SNAP_MARGIN) {
+      posX += distX * SNAP_STRENGTH;
+      if (Math.abs(tX - posX) < SNAP_LOCK) {
+        posX = tX; targetX = tX; velX = 0; 
+        isSnappedX = true; hasSnappedX = true;
+        doSnapX(targetX);
+      }
+    }
+  } else if (isSnappedX && !inputX) {
+    posX = targetX; velX = 0;
+  }
+
+  // 4. Snap-Logik Y (Magnet greift nur ohne Nutzer-Input)
+  const tY = Math.round(posY);
+  const distY = tY - posY;
+
+  if (!inputY && !isSnappedY) {
+    if (Math.abs(velY) < SNAP_THRESHOLD && Math.abs(distY) < SNAP_MARGIN) {
+      posY += distY * SNAP_STRENGTH;
+      if (Math.abs(tY - posY) < SNAP_LOCK) {
+        posY = tY; targetY = tY; velY = 0; 
+        isSnappedY = true; hasSnappedY = true;
+        doSnapY(targetY);
+      }
+    }
+  } else if (isSnappedY && !inputY) {
+    posY = targetY; velY = 0;
+  }
+
+  // 5. NaN-Schutz & Validierung
+  if (isNaN(posX)) { posX = targetX || 0; velX = 0; }
+  if (isNaN(posY)) { posY = targetY || 0; velY = 0; }
+
+  // ── Nullpunkt-Feedback ──
+  const nowOrigin = isSnappedX && isSnappedY && targetX === 0 && targetY === 0;
+  if (nowOrigin && !atOrigin) {
+    playOriginPling();
+    originFlash = 1; originPulse = 32;
+  }
+  atOrigin = nowOrigin;
+  if (originFlash > 0) originFlash = Math.max(0, originFlash - 0.04);
+  if (originPulse > 0) originPulse--;
+
+  // ── Abklingen Visuals ──
+  shakeX *= 0.6; shakeY *= 0.6;
+  if (Math.abs(shakeX) < 0.05) shakeX = 0;
+  if (Math.abs(shakeY) < 0.05) shakeY = 0;
+  if (pulseR > 0) { pulseR += 2.5; pulseA = Math.max(0, pulseA - 0.038); }
+  if (lineFlashXv > 0.01) lineFlashXv *= 0.70; else lineFlashXv = 0;
+  if (lineFlashYv > 0.01) lineFlashYv *= 0.70; else lineFlashYv = 0;
+}
+
+function doSnapX(nx) {
+  if (isSnappedX && targetX === nx && !hasSnappedX) return;
+  const isOrigin = nx === 0 && (isSnappedY ? targetY === 0 : Math.abs(posY) < 0.01);
+  const isAxis = nx === 0;
+  if (!atOrigin) playSnap(isAxis, isOrigin);
+  isSnappedX = true; targetX = nx; posX = nx; velX = 0;
+  shakeX = (posX > nx ? 1 : -1) * 5;
+  lineFlashXv = 1; lineFlashXpos = nx;
+  pulseR = 6; pulseA = 0.85;
+  pulseCol = isAxis ? 'rgba(255,160,60,A)' : 'rgba(126,200,227,A)';
+}
+
+function doSnapY(ny) {
+  if (isSnappedY && targetY === ny && !hasSnappedY) return;
+  const isOrigin = ny === 0 && (isSnappedX ? targetX === 0 : Math.abs(posX) < 0.01);
+  const isAxis = ny === 0;
+  if (!atOrigin) playSnap(isAxis, isOrigin);
+  isSnappedY = true; targetY = ny; posY = ny; velY = 0;
+  shakeY = (posY > ny ? 1 : -1) * 5;
+  lineFlashYv = 1; lineFlashYpos = ny;
+  pulseR = 6; pulseA = 0.85;
+  pulseCol = isAxis ? 'rgba(255,160,60,A)' : 'rgba(126,200,227,A)';
+}
+
+// ── ZEICHNEN ───────────────────────────────────────────────
+function drawBg(){ ctx.fillStyle='#0a0a1a'; ctx.fillRect(0,0,W,H); }
+
+function drawGrid(){
+  const l=posX-W/GRID-1, r=posX+W/GRID+1, t=posY+H/GRID+1, b=posY-H/GRID-1;
+  for(let x=Math.floor(l);x<=Math.ceil(r);x++){
+    ctx.strokeStyle=x%5===0?'#252545':'#16162e';
+    ctx.lineWidth=x%5===0?0.8:0.4;
+    ctx.beginPath(); ctx.moveTo(wx(x),0); ctx.lineTo(wx(x),H); ctx.stroke();
+  }
+  for(let y=Math.floor(b);y<=Math.ceil(t);y++){
+    ctx.strokeStyle=y%5===0?'#252545':'#16162e';
+    ctx.lineWidth=y%5===0?0.8:0.4;
+    ctx.beginPath(); ctx.moveTo(0,wy(y)); ctx.lineTo(W,wy(y)); ctx.stroke();
+  }
+}
+
+function drawGlowAndFlash(){
+  // Einzugszone leuchten
+  if (!isSnappedX) {
+    const nx=Math.round(posX), d=Math.abs(posX-nx);
+    if (d<SNAP_MARGIN && Math.abs(velX)<SNAP_THRESHOLD) {
+      const a=Math.pow(1-d/SNAP_MARGIN,2)*0.55;
+      ctx.strokeStyle=`rgba(126,200,227,${a})`; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.moveTo(wx(nx),0); ctx.lineTo(wx(nx),H); ctx.stroke();
+    }
+  }
+  if (!isSnappedY) {
+    const ny=Math.round(posY), d=Math.abs(posY-ny);
+    if (d<SNAP_MARGIN && Math.abs(velY)<SNAP_THRESHOLD) {
+      const a=Math.pow(1-d/SNAP_MARGIN,2)*0.55;
+      ctx.strokeStyle=`rgba(126,200,227,${a})`; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.moveTo(0,wy(ny)); ctx.lineTo(W,wy(ny)); ctx.stroke();
+    }
+  }
+  // Blitz auf Gitterlinie
+  if(lineFlashXv>0.01){
+    ctx.strokeStyle=`rgba(200,230,255,${lineFlashXv*0.75})`; ctx.lineWidth=5;
+    ctx.beginPath(); ctx.moveTo(wx(lineFlashXpos),0); ctx.lineTo(wx(lineFlashXpos),H); ctx.stroke();
+  }
+  if(lineFlashYv>0.01){
+    ctx.strokeStyle=`rgba(200,230,255,${lineFlashYv*0.75})`; ctx.lineWidth=5;
+    ctx.beginPath(); ctx.moveTo(0,wy(lineFlashYpos)); ctx.lineTo(W,wy(lineFlashYpos)); ctx.stroke();
+  }
+  // Pulse-Ring
+  if(pulseA>0.01){
+    const col = pulseCol.replace('A', pulseA.toFixed(2));
+    ctx.strokeStyle=col; ctx.lineWidth=2.5;
+    ctx.beginPath(); ctx.arc(SCX+shakeX, SCY+shakeY, pulseR,0,Math.PI*2); ctx.stroke();
+  }
+}
+
+// --- VISUALS: 3D CYBER AXES ---
+function drawAxes() {
+  const ox = wx(0), oy = wy(0);
+  const thickness = 10;
+  const half = thickness / 2;
+
+  ctx.save();
+  // Glow-Effekt für die Balken
+  ctx.shadowBlur = 15;
+  ctx.shadowColor = 'rgba(0, 255, 255, 0.7)';
+
+  // X-ACHSE (Horizontaler 3D-Balken)
+  if (oy > -half && oy < H + half) {
+    const xGrad = ctx.createLinearGradient(0, oy - half, 0, oy + half);
+    xGrad.addColorStop(0, '#b2f7ff');   // Highlight-Kante oben
+    xGrad.addColorStop(0.3, '#00f2ff'); // Neon-Cyan
+    xGrad.addColorStop(1, '#007a85');   // Schattenkante unten
+    
+    ctx.fillStyle = xGrad;
+    ctx.fillRect(0, oy - half, W, thickness);
+
+    // Pfeilspitze X (am rechten Rand fixiert)
+    ctx.beginPath();
+    ctx.moveTo(W - 2, oy);
+    ctx.lineTo(W - 18, oy - 10);
+    ctx.lineTo(W - 18, oy + 10);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Y-ACHSE (Vertikaler 3D-Balken)
+  if (ox > -half && ox < W + half) {
+    const yGrad = ctx.createLinearGradient(ox - half, 0, ox + half, 0);
+    yGrad.addColorStop(0, '#b2f7ff');   // Highlight-Kante links
+    yGrad.addColorStop(0.3, '#00f2ff'); // Neon-Cyan
+    yGrad.addColorStop(1, '#007a85');   // Schattenkante rechts
+
+    ctx.fillStyle = yGrad;
+    ctx.fillRect(ox - half, 0, thickness, H);
+
+    // Pfeilspitze Y (am oberen Rand fixiert)
+    ctx.beginPath();
+    ctx.moveTo(ox, 2);
+    ctx.lineTo(ox - 10, 18);
+    ctx.lineTo(ox + 10, 18);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  ctx.restore(); // Glow für Beschriftungen deaktivieren
+
+  // Achsen-Labels
+  ctx.fillStyle = '#7ec8e3';
+  ctx.font = 'bold 15px monospace';
+  if (oy > 20 && oy < H) {
+    ctx.textAlign = 'left'; 
+    ctx.fillText('x', W - 25, oy - 15);
+  }
+  if (ox > 0 && ox < W - 20) {
+    ctx.textAlign = 'center'; 
+    ctx.fillText('y', ox + 25, 22);
+  }
+}
+
+function drawTicks(){
+  const l=posX-W/GRID-1,r=posX+W/GRID+1,t=posY+H/GRID+1,b=posY-H/GRID-1;
+  const ox=wx(0),oy=wy(0);
+  ctx.textAlign='center';
+  for(let x=Math.floor(l);x<=Math.ceil(r);x++){
+    if(x===0) continue;
+    const sx=wx(x),isM=x%5===0,th=isM?10:6;
+    ctx.strokeStyle=isM?'#7ec8e3':'#4a4a8a'; ctx.lineWidth=isM?1.5:0.8;
+    ctx.beginPath(); ctx.moveTo(sx,oy-th); ctx.lineTo(sx,oy+th); ctx.stroke();
+    // Beschriftung X-Achse: Etwas weiter weg wegen Balkendicke
+    if(isM||GRID>=44){ ctx.fillStyle='#8888bb'; ctx.font='11px monospace'; ctx.fillText(x,sx,Math.min(Math.max(oy+22,14),H-4)); }
+  }
+  ctx.textAlign='right';
+  for(let y=Math.floor(b);y<=Math.ceil(t);y++){
+    if(y===0) continue;
+    const sy=wy(y),isM=y%5===0,tw=isM?10:6;
+    ctx.strokeStyle=isM?'#7ec8e3':'#4a4a8a'; ctx.lineWidth=isM?1.5:0.8;
+    ctx.beginPath(); ctx.moveTo(ox-tw,sy); ctx.lineTo(ox+tw,sy); ctx.stroke();
+    // Beschriftung Y-Achse: Etwas weiter links wegen Balkendicke
+    if(isM||GRID>=44){ ctx.fillStyle='#8888bb'; ctx.font='11px monospace'; ctx.fillText(y,Math.min(Math.max(ox-15,22),W-6),sy+4); }
+  }
+  ctx.fillStyle='#7ec8e3'; ctx.font='500 12px monospace'; ctx.textAlign='right';
+  ctx.fillText('0',Math.min(Math.max(wx(0)-10,22),W-8),Math.min(Math.max(wy(0)+20,12),H-4));
+}
+
+function drawOrigin(){
+  const ox=wx(0),oy=wy(0);
+  if(originPulse>0){
+    const p=1-originPulse/32, r=10+p*65, a=(1-p)*0.9;
+    ctx.strokeStyle=`rgba(255,240,80,${a})`; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(ox,oy,r,0,Math.PI*2); ctx.stroke();
+  }
+  if(originFlash>0.01){
+    const g=ctx.createRadialGradient(ox,oy,0,ox,oy,22);
+    g.addColorStop(0,`rgba(255,240,80,${originFlash*0.6})`);
+    g.addColorStop(1,'rgba(255,200,60,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(ox,oy,22,0,Math.PI*2); ctx.fill();
+  }
+  const ba=atOrigin?1:0.35+originFlash*0.65;
+  ctx.strokeStyle=`rgba(255,230,80,${ba})`; ctx.lineWidth=atOrigin?2:1.2;
+  const cs=atOrigin?9:6;
+  ctx.beginPath(); ctx.moveTo(ox-cs,oy-cs); ctx.lineTo(ox+cs,oy+cs); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(ox+cs,oy-cs); ctx.lineTo(ox-cs,oy+cs); ctx.stroke();
+  ctx.fillStyle=`rgba(255,240,80,${ba})`;
+  ctx.beginPath(); ctx.arc(ox,oy,atOrigin?5:3.5,0,Math.PI*2); ctx.fill();
+}
+
+function drawPlayer(){
+  const px=SCX+shakeX, py=SCY+shakeY;
+  // Nutze die neuen Flags isSnappedX/Y
+  const moving=!isSnappedX&&Math.abs(velX)>0.004 || !isSnappedY&&Math.abs(velY)>0.004;
+  // Klettern wird jetzt bei jeder vertikalen Bewegung ausgelöst, da die Achsenbeschränkung aufgehoben wurde
+  const verticalInput = keys['ArrowUp']||keys['w']||keys['W']||keys['ArrowDown']||keys['s']||keys['S'];
+  const climbing = verticalInput && Math.abs(velY) > 0.004;
+  
+  if(moving) walkFrame++;
+
+  if(climbing) drawClimbing(px,py);
+  else drawWalking(px,py,moving);
+
+  // Magnetring
+  const locked=isSnappedX&&isSnappedY;
+  const pulse=0.5+0.5*Math.sin(Date.now()*0.006);
+  ctx.strokeStyle=`rgba(255,180,60,${pulse*(locked?0.7:0.3)})`; ctx.lineWidth=locked?2:1;
+  ctx.beginPath(); ctx.arc(px,py,locked?16:12,0,Math.PI*2); ctx.stroke();
+  ctx.strokeStyle=`rgba(255,180,60,${pulse*(locked?0.25:0.1)})`; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.arc(px,py,locked?24:19,0,Math.PI*2); ctx.stroke();
+
+  // Kreuzfaden
+  ctx.strokeStyle=`rgba(240,192,64,${locked?0.5:0.22})`; ctx.lineWidth=0.9;
+  ctx.setLineDash([3,5]);
+  ctx.beginPath(); ctx.moveTo(px-28,py); ctx.lineTo(px+28,py); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px,py-28); ctx.lineTo(px,py+28); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Dot
+  const isOrigin=atOrigin;
+  const col=isOrigin?'#ffe050':locked?'#ffd060':'#f0c040';
+  const r=isOrigin?10:locked?9:6.5;
+  ctx.fillStyle=col; ctx.strokeStyle='#fff'; ctx.lineWidth=locked?2.5:1.5;
+  ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+
+  if(locked){
+    ctx.fillStyle='rgba(255,220,80,0.9)'; ctx.font='bold 11px monospace'; ctx.textAlign='center';
+    ctx.fillText(`(${targetX}|${targetY})`,px,py-r-6);
+  }
+
+  ctx.fillStyle='rgba(126,200,227,0.1)';
+  ctx.beginPath(); ctx.ellipse(px,py+28,13,4,0,0,Math.PI*2); ctx.fill();
+}
+
+function drawWalking(px,py,moving){
+  const t=walkFrame;
+  const leg=moving?Math.sin(t*0.2)*10:0, bob=moving?Math.abs(Math.sin(t*0.2))*2:0, by=py-27+bob;
+  ctx.strokeStyle='#f0c040'; ctx.lineWidth=3; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(px,by+30); ctx.lineTo(px-leg,py+28); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px,by+30); ctx.lineTo(px+leg,py+28); ctx.stroke();
+  const arm=moving?Math.sin(t*0.2)*8:0;
+  ctx.beginPath(); ctx.moveTo(px,by+10); ctx.lineTo(px-14+arm,by+26); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px,by+10); ctx.lineTo(px+14-arm,by+26); ctx.stroke();
+  ctx.fillStyle='#f0c040'; ctx.strokeStyle='#c89a10'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(px,by); ctx.lineTo(px+10,by+30); ctx.lineTo(px-10,by+30); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#ffeaa0'; ctx.strokeStyle='#c89a10'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(px,by-10,11,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#1a1a1a';
+  ctx.beginPath(); ctx.arc(px-4,by-11,2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(px+4,by-11,2,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#c89a10'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(px,by-8,4,0.2,Math.PI-0.2); ctx.stroke();
+}
+
+function drawClimbing(px,py){
+  const t=walkFrame, alt=Math.sin(t*0.25), by=py-20;
+  ctx.strokeStyle='#f0c040'; ctx.lineWidth=3; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(px,by+28); ctx.lineTo(px-10,py+28); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px,by+28); ctx.lineTo(px+10,py+28); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px,by+8); ctx.lineTo(px-18,by-4+alt*12); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px,by+8); ctx.lineTo(px+18,by-4-alt*12); ctx.stroke();
+  ctx.fillStyle='#60d060'; ctx.strokeStyle='#208a20'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(px-4,by); ctx.lineTo(px+4,by); ctx.lineTo(px+6,by+28); ctx.lineTo(px-6,by+28); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#ffeaa0'; ctx.strokeStyle='#c89a10'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(px,by-10,11,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#1a1a1a';
+  ctx.beginPath(); ctx.arc(px-4,by-10,2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(px+4,by-10,2,0,Math.PI*2); ctx.fill();
+}
+
+function loop(){
+  updatePhysics();
+  drawBg(); drawGrid(); drawGlowAndFlash();
+  drawAxes(); drawTicks(); drawOrigin(); drawPlayer();
+  document.getElementById('pos-display').textContent =
+    isSnappedX&&isSnappedY ? `( ${targetX} | ${targetY} )` :
+    `( ${posX.toFixed(1)} | ${posY.toFixed(1)} )`;
+  requestAnimationFrame(loop);
+}
+
+['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].forEach(k=>
+  document.addEventListener('keydown',e=>{ if(e.key===k) e.preventDefault(); })
+);
+document.addEventListener('keydown', e=>{ ensureAudio(); keys[e.key]=true; });
+document.addEventListener('keyup',   e=>{ keys[e.key]=false; });
+
+function hold(id,key){
+  const b=document.getElementById(id);
+  b.addEventListener('pointerdown', ()=>{ ensureAudio(); keys[key]=true; });
+  b.addEventListener('pointerup',   ()=>{ keys[key]=false; });
+  b.addEventListener('pointerleave',()=>{ keys[key]=false; });
+}
+hold('btn-left','ArrowLeft'); hold('btn-right','ArrowRight');
+hold('btn-up','ArrowUp');     hold('btn-down','ArrowDown');
+
+loop();
+</script>
