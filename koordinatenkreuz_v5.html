@@ -97,6 +97,7 @@ let pulseR=0, pulseA=0, pulseCol='#7ec8e3';
 let lineFlashXv=0, lineFlashXpos=0;
 let lineFlashYv=0, lineFlashYpos=0;
 let atOrigin=true, originFlash=0, originPulse=0;
+let particles = []; // Partikel für Spezial-Effekte
 
 function wx(wx){ return SCX+(wx-posX)*GRID; }
 function wy(wy){ return SCY-(wy-posY)*GRID; }
@@ -181,6 +182,7 @@ function updatePhysics() {
   if (nowOrigin && !atOrigin) {
     playOriginPling();
     originFlash = 1; originPulse = 32;
+    spawnOriginParticles(); // Goldener Schwall
   }
   atOrigin = nowOrigin;
   if (originFlash > 0) originFlash = Math.max(0, originFlash - 0.04);
@@ -382,6 +384,42 @@ function drawOrigin(){
   ctx.beginPath(); ctx.arc(ox,oy,atOrigin?5:3.5,0,Math.PI*2); ctx.fill();
 }
 
+// --- VISUALS: PARTICLE SYSTEM ---
+function spawnOriginParticles() {
+  for (let i = 0; i < 28; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 0.02 + Math.random() * 0.08;
+    particles.push({
+      x: 0, y: 0, // Welt-Koordinate (Ursprung)
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      alpha: 1.0,
+      decay: 0.01 + Math.random() * 0.02,
+      color: '#FFD700'
+    });
+  }
+}
+
+function updateAndDrawParticles() {
+  if (particles.length === 0) return;
+  ctx.save();
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.alpha -= p.decay;
+    if (p.alpha <= 0) {
+      particles.splice(i, 1);
+      continue;
+    }
+    ctx.globalAlpha = p.alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(wx(p.x), wy(p.y), 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 // --- VISUALS: QUADRANT LOCK OVERLAY ---
 function drawLockedZones() {
   const ox = wx(0), oy = wy(0);
@@ -485,7 +523,8 @@ function loop(){
   updatePhysics();
   drawBg(); drawGrid(); drawGlowAndFlash();
   drawAxes(); 
-  drawLockedZones(); // Überlagert die negativen Bereiche der Achsen
+  updateAndDrawParticles(); // Gezeichnet unter dem Locked-Overlay
+  drawLockedZones(); // Überlagert die negativen Bereiche
   drawTicks(); drawOrigin(); drawPlayer();
   document.getElementById('pos-display').textContent =
     isSnappedX&&isSnappedY ? `( ${targetX} | ${targetY} )` :
