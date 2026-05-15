@@ -132,6 +132,12 @@ function updatePhysics() {
   posX += velX;
   posY += velY;
 
+  // --- QUADRANTEN-SPERRE (X >= 0, Y >= 0) ---
+  // Wir überschreiben die Position hart, falls sie ins Minus rutscht, 
+  // um Zappeln bei Dauer-Input gegen die Wand zu verhindern.
+  if (posX < 0) { posX = 0; velX = 0; isSnappedX = true; targetX = 0; }
+  if (posY < 0) { posY = 0; velY = 0; isSnappedY = true; targetY = 0; }
+
   // 3. Snap-Logik X (Magnet greift nur ohne Nutzer-Input)
   const tX = Math.round(posX);
   const distX = tX - posX;
@@ -376,6 +382,25 @@ function drawOrigin(){
   ctx.beginPath(); ctx.arc(ox,oy,atOrigin?5:3.5,0,Math.PI*2); ctx.fill();
 }
 
+// --- VISUALS: QUADRANT LOCK OVERLAY ---
+function drawLockedZones() {
+  const ox = wx(0), oy = wy(0);
+  ctx.save();
+  ctx.fillStyle = 'rgba(5, 5, 20, 0.75)'; // Dunkles "Inaktiv"-Blau
+  
+  // Bereich links der Y-Achse (x < 0)
+  if (ox > 0) {
+    ctx.fillRect(0, 0, ox, H);
+  }
+  // Bereich unterhalb der X-Achse (y < 0) - deckt Quadrant IV ab
+  // oy ist der Pixelwert der X-Achse; alles darunter ist mathematisch negativ.
+  if (oy < H) {
+    const startX = Math.max(0, ox);
+    ctx.fillRect(startX, oy, W - startX, H - oy);
+  }
+  ctx.restore();
+}
+
 function drawPlayer(){
   const px=SCX+shakeX, py=SCY+shakeY;
   // Nutze die neuen Flags isSnappedX/Y
@@ -459,7 +484,9 @@ function drawClimbing(px,py){
 function loop(){
   updatePhysics();
   drawBg(); drawGrid(); drawGlowAndFlash();
-  drawAxes(); drawTicks(); drawOrigin(); drawPlayer();
+  drawAxes(); 
+  drawLockedZones(); // Überlagert die negativen Bereiche der Achsen
+  drawTicks(); drawOrigin(); drawPlayer();
   document.getElementById('pos-display').textContent =
     isSnappedX&&isSnappedY ? `( ${targetX} | ${targetY} )` :
     `( ${posX.toFixed(1)} | ${posY.toFixed(1)} )`;
